@@ -1,5 +1,9 @@
 # HeroIntel Capture
 
+<p align="center">
+  <img src="thumbnail.png" alt="HeroIntel Capture home window" width="520">
+</p>
+
 A lightweight Windows tray app for [HeroIntel](https://herointel.gg) — Overwatch stat-tracking website. Press F9 twice per match (once on rank progress, once on the scoreboard) and your match is uploaded and parsed automatically.
 
 ## What it does
