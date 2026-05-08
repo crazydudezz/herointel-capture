@@ -70,7 +70,7 @@ ctk.set_default_color_theme("dark-blue")
 # ── Config ─────────────────────────────────────────────────────────────────────
 
 APP_NAME = "HeroIntelCapture"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 APPDATA = os.environ.get("APPDATA", str(Path.home()))
 CONFIG_DIR = Path(APPDATA) / APP_NAME
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -125,6 +125,50 @@ def save_config(cfg: dict):
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     with open(CONFIG_FILE, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2)
+
+# ── Windows autostart (HKCU\…\Run registration) ───────────────────────────────
+
+_AUTOSTART_KEY  = r"Software\Microsoft\Windows\CurrentVersion\Run"
+_AUTOSTART_NAME = "HeroIntelCapture"
+
+def _autostart_target() -> str:
+    """Command line stored in HKCU Run. EXE path when frozen, else python+main.py."""
+    if getattr(sys, "frozen", False):
+        return f'"{sys.executable}"'
+    return f'"{sys.executable}" "{Path(__file__).resolve()}"'
+
+def is_autostart_enabled() -> bool:
+    if sys.platform != "win32":
+        return False
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _AUTOSTART_KEY, 0, winreg.KEY_READ) as key:
+            value, _ = winreg.QueryValueEx(key, _AUTOSTART_NAME)
+            return bool(value)
+    except OSError:
+        return False
+    except Exception:
+        return False
+
+def set_autostart(enabled: bool) -> bool:
+    """Enable or disable launch-on-login. Returns True on success."""
+    if sys.platform != "win32":
+        return False
+    try:
+        import winreg
+        if enabled:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _AUTOSTART_KEY, 0, winreg.KEY_WRITE) as key:
+                winreg.SetValueEx(key, _AUTOSTART_NAME, 0, winreg.REG_SZ, _autostart_target())
+        else:
+            try:
+                with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _AUTOSTART_KEY, 0, winreg.KEY_WRITE) as key:
+                    winreg.DeleteValue(key, _AUTOSTART_NAME)
+            except FileNotFoundError:
+                pass  # already absent
+        return True
+    except Exception as e:
+        print(f"[autostart] failed: {e}")
+        return False
 
 # ── Resource path (handles PyInstaller --onefile) ──────────────────────────────
 
@@ -246,6 +290,68 @@ def _win_set_icon(window):
             send_message(top_hwnd, _WM_SETICON, _ICON_BIG, big)
     except Exception as e:
         print(f"[icon] WM_SETICON failed: {e}")
+
+
+def _force_dark_titlebar(window):
+    """Apply DWM dark mode to the window's title bar on Windows 10/11.
+    CTkToplevel only applies this on FocusIn, which fires after the window has
+    already been painted with the light OS theme — causing a flash. Calling
+    this synchronously before the window becomes visible eliminates that flash."""
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+        hwnd = wintypes.HWND(int(window.winfo_id()))
+        GA_ROOT = 2
+        get_ancestor = ctypes.windll.user32.GetAncestor
+        get_ancestor.restype = wintypes.HWND
+        get_ancestor.argtypes = [wintypes.HWND, ctypes.c_uint]
+        top_hwnd = get_ancestor(hwnd, GA_ROOT) or hwnd
+
+        DWMWA_USE_IMMERSIVE_DARK_MODE = 20      # Win10 1903+ / Win11
+        DWMWA_USE_IMMERSIVE_DARK_MODE_OLD = 19  # Win10 1809
+        value = ctypes.c_int(1)
+        dwm = ctypes.windll.dwmapi
+        if dwm.DwmSetWindowAttribute(
+            top_hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE,
+            ctypes.byref(value), ctypes.sizeof(value)
+        ) != 0:
+            dwm.DwmSetWindowAttribute(
+                top_hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE_OLD,
+                ctypes.byref(value), ctypes.sizeof(value)
+            )
+    except Exception:
+        pass
+
+
+def _prepare_dialog(dlg):
+    """Hide a freshly-created CTk window before it paints, force a dark title
+    bar, and apply our icon — all synchronously. Caller must invoke
+    `_reveal_dialog(dlg)` once the window is fully built."""
+    try:
+        # alpha=0 is applied by Windows DWM before the first frame is shown,
+        # so the window never flashes white during construction.
+        dlg.attributes("-alpha", 0.0)
+    except Exception:
+        pass
+    try:
+        dlg.withdraw()
+    except Exception:
+        pass
+    _force_dark_titlebar(dlg)
+    _apply_window_icon(dlg)
+
+
+def _reveal_dialog(dlg):
+    """Show a dialog prepared with `_prepare_dialog` once it's fully built."""
+    try:
+        dlg.update_idletasks()
+        dlg.deiconify()
+        dlg.lift()
+        dlg.attributes("-alpha", 1.0)
+    except Exception:
+        pass
 
 
 def _apply_window_icon(window):
@@ -422,12 +528,37 @@ def complete_pending_match(uid: str, doc_id: str, sb_url: str, sb_path: str, tok
 
 # ── Screenshot capture ─────────────────────────────────────────────────────────
 
+def _list_monitors() -> "list[tuple[int, str]]":
+    """Enumerate available monitors. Returns [(index, label), ...] where index is
+    the position in mss().monitors (1+; 0 is the virtual all-displays bounds)."""
+    try:
+        with mss.mss() as sct:
+            monitors = sct.monitors
+            out = []
+            for i, m in enumerate(monitors[1:], start=1):
+                w, h = m.get("width", 0), m.get("height", 0)
+                left, top = m.get("left", 0), m.get("top", 0)
+                is_primary = (left == 0 and top == 0)
+                label = f"Monitor {i} — {w}×{h}" + ("  (Primary)" if is_primary else "")
+                out.append((i, label))
+            return out or [(1, "Primary monitor")]
+    except Exception:
+        return [(1, "Primary monitor")]
+
+
 def _grab_jpeg() -> bytes:
+    """Capture the configured monitor and return JPEG bytes at max quality.
+    quality=100 keeps OCR-grade detail for hero portrait matching; without it,
+    JPEG quantization can blur small features (rank icons, stat digits)."""
+    monitor_index = max(1, int(_config.get("monitor_index", 1) or 1))
     with mss.mss() as sct:
-        shot = sct.grab(sct.monitors[1])
+        monitors = sct.monitors
+        if monitor_index >= len(monitors):
+            monitor_index = 1  # paired monitor was unplugged — fall back to primary
+        shot = sct.grab(monitors[monitor_index])
         img = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
     buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=85, optimize=True)
+    img.save(buf, format="JPEG", quality=100, subsampling=0, optimize=True)
     return buf.getvalue()
 
 def _ts_label() -> str:
@@ -475,7 +606,7 @@ def _do_capture():
     except Exception as e:
         _push_recent("⚠", f"Auth error: {e}")
         _set_state("⚠️ Not paired", False)
-        _show_toast("HeroIntel — Not paired", "Open Settings → Pair desktop.")
+        _show_toast("HeroIntel — Not paired", "Open Settings → Pair desktop.", level="error")
         _update_status_indicator()
         return
 
@@ -499,7 +630,7 @@ def _do_capture():
         except Exception as e:
             _push_recent("⚠", f"Error: {e}")
             _set_state("⚠️ Ready", False)
-            _show_toast("HeroIntel — Error", str(e)[:120])
+            _show_toast("HeroIntel — Error", str(e)[:120], level="error")
 
     elif _capture_state == "waiting_scoreboard":
         _set_state("📸 Capturing scoreboard...", False)
@@ -517,7 +648,7 @@ def _do_capture():
         except Exception as e:
             _push_recent("⚠", f"Error: {e}")
             _set_state("⚠️ Waiting for scoreboard...", True)
-            _show_toast("HeroIntel — Error", str(e)[:120])
+            _show_toast("HeroIntel — Error", str(e)[:120], level="error")
 
 def on_hotkey():
     threading.Thread(target=_do_capture, daemon=True).start()
@@ -541,7 +672,17 @@ def cancel_pending():
 
 # ── Toast notification ─────────────────────────────────────────────────────────
 
-def _show_toast(title: str, message: str):
+def _show_toast(title: str, message: str, *, level: str = "info"):
+    """Show a Windows toast. Suppressed by user's notification preference:
+       "all" (default) — every toast
+       "errors"        — only level="error"
+       "off"           — never
+    """
+    pref = (_config.get("notifications") or "all")
+    if pref == "off":
+        return
+    if pref == "errors" and level != "error":
+        return
     try:
         from plyer import notification  # type: ignore
         notification.notify(title=title, message=message, app_name=APP_NAME, timeout=4)
@@ -688,12 +829,48 @@ def _status_watcher():
 
 
 def _open_settings(root: ctk.CTk):
-    global _config, _current_hotkey, _current_cancel_hotkey
+    global _config, _current_hotkey, _current_cancel_hotkey, _id_token, _token_expiry
     root.withdraw()
     new_cfg = run_settings_dialog(_config)
     if not new_cfg:
         root.deiconify()
         return
+
+    # Apply autostart toggle (registry write happens regardless of other paths).
+    autostart_requested = new_cfg.pop("_autostart", None)
+    if autostart_requested is not None and autostart_requested != is_autostart_enabled():
+        if not set_autostart(autostart_requested):
+            messagebox.showwarning(
+                "Start with Windows",
+                "Couldn't update the auto-start registry entry. Try running as your "
+                "user (not a different account) or check Group Policy.",
+                parent=root,
+            )
+
+    # Sign out if requested — clear identity + force re-pair before continuing.
+    if new_cfg.pop("_signout", False):
+        try:
+            keyring.delete_password(KEYRING_SERVICE, KEYRING_REFRESH_KEY)
+        except Exception:
+            pass
+        _id_token = ""
+        _token_expiry = 0.0
+        new_cfg.pop("uid", None)
+        new_cfg.pop("displayName", None)
+        new_cfg.pop("email", None)
+        # Force re-pair immediately so the user isn't stuck in an unauthenticated state
+        paired = run_pairing_dialog(root)
+        if not paired:
+            # User cancelled — save the config without account info; status watcher
+            # will surface "Not paired" until they re-pair via Settings.
+            save_config(new_cfg)
+            _config = new_cfg
+            _update_status_indicator()
+            root.deiconify()
+            return
+        new_cfg["uid"] = paired["uid"]
+        new_cfg["displayName"] = paired.get("displayName", "")
+        new_cfg["email"] = paired.get("email", "")
 
     # Re-pair if requested
     if new_cfg.pop("_repair", False):
@@ -702,6 +879,8 @@ def _open_settings(root: ctk.CTk):
             root.deiconify()
             return
         new_cfg["uid"] = paired["uid"]
+        new_cfg["displayName"] = paired.get("displayName", "")
+        new_cfg["email"] = paired.get("email", "")
 
     # Hotkey rebind
     new_hotkey = new_cfg.get("hotkey", "f9")
@@ -747,11 +926,11 @@ def run_pairing_dialog(parent=None) -> "dict | None":
     global _id_token, _token_expiry
 
     dlg = ctk.CTkToplevel(parent) if parent else ctk.CTk()
+    _prepare_dialog(dlg)  # alpha=0 + withdraw + dark titlebar + icon, before first paint
     dlg.title("HeroIntel Capture — Pair desktop")
     dlg.geometry("520x460")
     dlg.resizable(False, False)
     dlg.configure(fg_color=BG)
-    _apply_window_icon(dlg)
 
     # Tkinter is not thread-safe — the background pairing thread only mutates
     # this dict; the dialog drains pending UI updates from it via dlg.after().
@@ -900,6 +1079,8 @@ def run_pairing_dialog(parent=None) -> "dict | None":
             if res.get("status") == "claimed":
                 custom_token = res["customToken"]
                 uid = res["uid"]
+                display_name = res.get("displayName", "") or ""
+                email = res.get("email", "") or ""
                 try:
                     id_token, refresh_token = sign_in_custom_token(custom_token)
                 except Exception as e:
@@ -909,9 +1090,13 @@ def run_pairing_dialog(parent=None) -> "dict | None":
                 _id_token = id_token
                 _token_expiry = time.time() + 3500
                 with state_lock:
-                    state["result"] = {"uid": uid}
+                    state["result"] = {"uid": uid, "displayName": display_name, "email": email}
                     state["done"] = True
-                _post("Paired ✓", GREEN)
+                # Confirm the account on the dialog so the user sees who they paired as.
+                if display_name or email:
+                    _post(f"Paired as {display_name or email} ✓", GREEN)
+                else:
+                    _post("Paired ✓", GREEN)
                 return
             if res.get("status") == "expired":
                 _post("Code expired. Get a new one.", YELLOW)
@@ -925,6 +1110,9 @@ def run_pairing_dialog(parent=None) -> "dict | None":
         dlg.transient(parent)
         dlg.grab_set()
         _position_near(dlg, parent)
+
+    _reveal_dialog(dlg)
+
     dlg.wait_window()
     with state_lock:
         state["abort_thread"] = True
@@ -933,17 +1121,29 @@ def run_pairing_dialog(parent=None) -> "dict | None":
 
 # ── Settings dialog ────────────────────────────────────────────────────────────
 
+_NOTIFY_LABELS = [("All", "all"), ("Errors only", "errors"), ("Off", "off")]
+
+
+def _section_header(parent, text):
+    return ctk.CTkLabel(parent, text=text, text_color=FG_DIM,
+                        font=("Segoe UI", 10, "bold"), anchor="w")
+
+
+def _section_separator(parent):
+    return ctk.CTkFrame(parent, fg_color=BORDER, height=1, corner_radius=0)
+
+
 def run_settings_dialog(existing: dict) -> "dict | None":
     dlg = ctk.CTkToplevel(_tk_root) if _tk_root else ctk.CTk()
+    _prepare_dialog(dlg)
     dlg.title("HeroIntel Capture — Settings")
-    dlg.geometry("520x420")
+    dlg.geometry("540x720")
     dlg.resizable(False, False)
     dlg.configure(fg_color=BG)
-    _apply_window_icon(dlg)
 
     # ── Header with logo ──
     hdr = ctk.CTkFrame(dlg, fg_color=BG_RAISED, corner_radius=0, height=64)
-    hdr.pack(fill="x")
+    hdr.pack(side="top", fill="x")
     hdr.pack_propagate(False)
     logo_img = _get_wordmark_image(36)
     if logo_img is not None:
@@ -951,66 +1151,161 @@ def run_settings_dialog(existing: dict) -> "dict | None":
     ctk.CTkLabel(hdr, text="Settings", text_color=BLUE,
                  font=("Segoe UI", 16, "bold")).pack(side="left", pady=14)
 
+    # Save/Cancel row anchored to the bottom FIRST so body content can never
+    # push it offscreen if the window ends up shorter than expected.
+    btn_row = ctk.CTkFrame(dlg, fg_color=BG, corner_radius=0)
+    btn_row.pack(side="bottom", fill="x", padx=20, pady=(8, 20))
+    btn_row.columnconfigure(0, weight=1)
+    btn_row.columnconfigure(1, weight=1)
+
     body = ctk.CTkFrame(dlg, fg_color=BG, corner_radius=0)
-    body.pack(fill="both", expand=True, padx=20, pady=(16, 4))
-
-    ctk.CTkLabel(body, text="HOTKEYS", text_color=FG_DIM,
-                 font=("Segoe UI", 10, "bold")).grid(
-        row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
-
-    ctk.CTkLabel(body, text="Capture", text_color=FG, font=("Segoe UI", 12),
-                 anchor="w", justify="left").grid(row=1, column=0, sticky="w", pady=6)
-    hotkey_var = tk.StringVar(value=existing.get("hotkey", "f9"))
-    ctk.CTkEntry(body, textvariable=hotkey_var, width=280, height=36,
-                 font=("Segoe UI", 12),
-                 fg_color=BG_INPUT, border_color=BORDER, text_color=FG,
-                 corner_radius=8).grid(row=1, column=1, sticky="e", pady=6)
-
-    ctk.CTkLabel(body, text="Cancel (optional)", text_color=FG, font=("Segoe UI", 12),
-                 anchor="w", justify="left").grid(row=2, column=0, sticky="w", pady=6)
-    cancel_var = tk.StringVar(value=existing.get("cancel_hotkey", ""))
-    ctk.CTkEntry(body, textvariable=cancel_var, width=280, height=36, placeholder_text="e.g. f8",
-                 font=("Segoe UI", 12),
-                 fg_color=BG_INPUT, border_color=BORDER, text_color=FG,
-                 corner_radius=8).grid(row=2, column=1, sticky="e", pady=6)
-
-    ctk.CTkLabel(body, text="ACCOUNT", text_color=FG_DIM,
-                 font=("Segoe UI", 10, "bold")).grid(
-        row=3, column=0, columnspan=2, sticky="w", pady=(18, 6))
-
-    paired_uid = existing.get("uid", "")
-    paired_label = f"Paired as {paired_uid[:10]}…" if paired_uid else "Not paired"
-    ctk.CTkLabel(body, text=paired_label, text_color=FG_DIM, font=("Segoe UI", 11)).grid(
-        row=4, column=0, sticky="w", pady=4)
-
+    body.pack(side="top", fill="both", expand=True, padx=20, pady=(14, 4))
     body.columnconfigure(0, weight=1)
     body.columnconfigure(1, weight=0)
 
+    row = 0
+
+    # ── HOTKEYS ──
+    _section_header(body, "HOTKEYS").grid(row=row, column=0, columnspan=2, sticky="w", pady=(0, 6)); row += 1
+
+    ctk.CTkLabel(body, text="Capture", text_color=FG, font=("Segoe UI", 12),
+                 anchor="w", justify="left").grid(row=row, column=0, sticky="w", pady=4)
+    hotkey_var = tk.StringVar(value=existing.get("hotkey", "f9"))
+    ctk.CTkEntry(body, textvariable=hotkey_var, width=260, height=34,
+                 font=("Segoe UI", 12),
+                 fg_color=BG_INPUT, border_color=BORDER, text_color=FG,
+                 corner_radius=8).grid(row=row, column=1, sticky="e", pady=4)
+    row += 1
+
+    ctk.CTkLabel(body, text="Cancel (optional)", text_color=FG, font=("Segoe UI", 12),
+                 anchor="w", justify="left").grid(row=row, column=0, sticky="w", pady=4)
+    cancel_var = tk.StringVar(value=existing.get("cancel_hotkey", ""))
+    ctk.CTkEntry(body, textvariable=cancel_var, width=260, height=34, placeholder_text="e.g. f8",
+                 font=("Segoe UI", 12),
+                 fg_color=BG_INPUT, border_color=BORDER, text_color=FG,
+                 corner_radius=8).grid(row=row, column=1, sticky="e", pady=4)
+    row += 1
+
+    _section_separator(body).grid(row=row, column=0, columnspan=2, sticky="ew", pady=(14, 12)); row += 1
+
+    # ── CAPTURE ──
+    _section_header(body, "CAPTURE").grid(row=row, column=0, columnspan=2, sticky="w", pady=(0, 6)); row += 1
+
+    monitors = _list_monitors()
+    monitor_labels = [label for _, label in monitors]
+    monitor_label_to_index = {label: idx for idx, label in monitors}
+    current_index = int(existing.get("monitor_index", 1) or 1)
+    current_label = next((lbl for idx, lbl in monitors if idx == current_index), monitor_labels[0])
+    monitor_var = tk.StringVar(value=current_label)
+
+    ctk.CTkLabel(body, text="Monitor", text_color=FG, font=("Segoe UI", 12),
+                 anchor="w", justify="left").grid(row=row, column=0, sticky="w", pady=4)
+    ctk.CTkOptionMenu(body, values=monitor_labels, variable=monitor_var, width=260, height=34,
+                      font=("Segoe UI", 11),
+                      fg_color=BG_INPUT, button_color=BG_CARD, button_hover_color=BG_INPUT,
+                      text_color=FG, dropdown_fg_color=BG_CARD, dropdown_text_color=FG,
+                      dropdown_hover_color=BG_INPUT, corner_radius=8).grid(
+        row=row, column=1, sticky="e", pady=4)
+    row += 1
+
+    _section_separator(body).grid(row=row, column=0, columnspan=2, sticky="ew", pady=(14, 12)); row += 1
+
+    # ── BEHAVIOR ──
+    _section_header(body, "BEHAVIOR").grid(row=row, column=0, columnspan=2, sticky="w", pady=(0, 6)); row += 1
+
+    autostart_var = tk.BooleanVar(value=is_autostart_enabled())
+    ctk.CTkCheckBox(body, text="Start with Windows", variable=autostart_var,
+                    font=("Segoe UI", 12), text_color=FG,
+                    fg_color=ORANGE, hover_color="#e07010",
+                    border_color=BORDER, checkmark_color="white",
+                    corner_radius=4).grid(row=row, column=0, columnspan=2, sticky="w", pady=4)
+    row += 1
+
+    ctk.CTkLabel(body, text="Notifications", text_color=FG, font=("Segoe UI", 12),
+                 anchor="w", justify="left").grid(row=row, column=0, sticky="w", pady=4)
+    notify_label_to_value = {label: value for label, value in _NOTIFY_LABELS}
+    notify_value_to_label = {value: label for label, value in _NOTIFY_LABELS}
+    notify_current = existing.get("notifications") or "all"
+    notify_var = tk.StringVar(value=notify_value_to_label.get(notify_current, "All"))
+    ctk.CTkOptionMenu(body, values=[label for label, _ in _NOTIFY_LABELS], variable=notify_var,
+                      width=260, height=34, font=("Segoe UI", 11),
+                      fg_color=BG_INPUT, button_color=BG_CARD, button_hover_color=BG_INPUT,
+                      text_color=FG, dropdown_fg_color=BG_CARD, dropdown_text_color=FG,
+                      dropdown_hover_color=BG_INPUT, corner_radius=8).grid(
+        row=row, column=1, sticky="e", pady=4)
+    row += 1
+
+    _section_separator(body).grid(row=row, column=0, columnspan=2, sticky="ew", pady=(14, 12)); row += 1
+
+    # ── ACCOUNT ──
+    _section_header(body, "ACCOUNT").grid(row=row, column=0, columnspan=2, sticky="w", pady=(0, 6)); row += 1
+
+    paired_uid = existing.get("uid", "")
+    paired_name = existing.get("displayName", "")
+    paired_email = existing.get("email", "")
+
+    acct_text = ctk.CTkFrame(body, fg_color="transparent", corner_radius=0)
+    acct_text.grid(row=row, column=0, sticky="w", pady=4)
+    if paired_uid:
+        primary = paired_name or paired_email or f"uid {paired_uid[:10]}…"
+        ctk.CTkLabel(acct_text, text=primary, text_color=FG, font=("Segoe UI", 12, "bold"),
+                     anchor="w", justify="left").pack(anchor="w")
+        if paired_name and paired_email:
+            ctk.CTkLabel(acct_text, text=paired_email, text_color=FG_MUTED,
+                         font=("Segoe UI", 10), anchor="w", justify="left").pack(anchor="w")
+    else:
+        ctk.CTkLabel(acct_text, text="Not paired", text_color=FG_DIM, font=("Segoe UI", 12),
+                     anchor="w", justify="left").pack(anchor="w")
+
     state = {"result": None}
 
+    def collect_base() -> dict:
+        return {
+            **existing,
+            "hotkey": hotkey_var.get().strip() or "f9",
+            "cancel_hotkey": cancel_var.get().strip(),
+            "monitor_index": monitor_label_to_index.get(monitor_var.get(), 1),
+            "notifications": notify_label_to_value.get(notify_var.get(), "all"),
+            "_autostart": bool(autostart_var.get()),
+        }
+
     def repair():
-        state["result"] = {**existing,
-                           "hotkey": hotkey_var.get().strip() or "f9",
-                           "cancel_hotkey": cancel_var.get().strip(),
-                           "_repair": True}
-        dlg.destroy()
-
-    ctk.CTkButton(body, text="Re-pair", command=repair,
-                  fg_color=BG_CARD, hover_color=BG_INPUT, text_color=FG_DIM,
-                  font=("Segoe UI", 11), corner_radius=8, height=36, width=110).grid(
-        row=4, column=1, sticky="e", pady=4)
-
-    def save():
-        cfg = {**existing,
-               "hotkey": hotkey_var.get().strip() or "f9",
-               "cancel_hotkey": cancel_var.get().strip()}
+        cfg = collect_base()
+        cfg["_repair"] = True
         state["result"] = cfg
         dlg.destroy()
 
-    btn_row = ctk.CTkFrame(dlg, fg_color=BG, corner_radius=0)
-    btn_row.pack(fill="x", padx=20, pady=(8, 20))
-    btn_row.columnconfigure(0, weight=1)
-    btn_row.columnconfigure(1, weight=1)
+    def sign_out():
+        if not messagebox.askyesno(
+            "Sign out",
+            "Sign out and forget this device's pairing?\n\n"
+            "You'll need to pair again to capture matches.",
+            parent=dlg,
+        ):
+            return
+        cfg = collect_base()
+        cfg["_signout"] = True
+        state["result"] = cfg
+        dlg.destroy()
+
+    btn_col = ctk.CTkFrame(body, fg_color="transparent", corner_radius=0)
+    btn_col.grid(row=row, column=1, sticky="ne", pady=4)
+    ctk.CTkButton(btn_col, text="Re-pair", command=repair,
+                  fg_color=BG_CARD, hover_color=BG_INPUT, text_color=FG_DIM,
+                  font=("Segoe UI", 11), corner_radius=8, height=32, width=110).pack(
+        anchor="e", pady=(0, 4))
+    if paired_uid:
+        ctk.CTkButton(btn_col, text="Sign out", command=sign_out,
+                      fg_color="#3b1f1f", hover_color="#5c2a2a", text_color=RED,
+                      font=("Segoe UI", 11), corner_radius=8, height=32, width=110).pack(
+            anchor="e")
+    row += 1
+
+    def save():
+        state["result"] = collect_base()
+        dlg.destroy()
+
+    # Populate the bottom-anchored btn_row created at the top of the function.
     ctk.CTkButton(btn_row, text="Save", command=save,
                   fg_color=ORANGE, hover_color="#e07010", text_color="white",
                   font=("Segoe UI", 12, "bold"), corner_radius=8, height=42).grid(
@@ -1024,6 +1319,9 @@ def run_settings_dialog(existing: dict) -> "dict | None":
         dlg.transient(_tk_root)
         dlg.grab_set()
         _position_near(dlg, _tk_root)
+
+    _reveal_dialog(dlg)
+
     dlg.wait_window()
     return state["result"]
 
@@ -1100,6 +1398,8 @@ def main():
         if not paired:
             sys.exit(0)
         _config["uid"] = paired["uid"]
+        _config["displayName"] = paired.get("displayName", "")
+        _config["email"] = paired.get("email", "")
         _config.setdefault("hotkey", "f9")
         save_config(_config)
 
